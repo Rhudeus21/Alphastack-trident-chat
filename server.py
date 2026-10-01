@@ -15,15 +15,20 @@ def seed():
       {'id':'m5','from':'studio','to':['self'],'subject':'Your design files are ready','body':'Hi! Your updated brand assets are ready for review. I included the logo variations and color palette we discussed.','time':now-86400000,'unread':False,'favorite':True,'attachments':[{'name':'brand-assets.pdf','size':'2.8 MB'}],'replyTo':None},
       {'id':'m6','from':'dad','to':['self'],'subject':'Sunday dinner 🍲','body':'Your favorite is on the menu. Come by around 6?','time':now-172800000,'unread':False,'favorite':False,'attachments':[],'replyTo':None},
       {'id':'m7','from':'newsletter','to':['self'],'subject':'A little inspiration for your week','body':'Three ideas to help you slow down, reset, and make space for what matters.','time':now-259200000,'unread':False,'favorite':False,'attachments':[],'replyTo':None}
-    ], 'replied': []}
+    ], 'replied': [], 'otp_flows': {}}
 
 def load():
     try:
         with open(DATA_FILE, 'r', encoding='utf-8') as f: db=json.load(f)
         db.setdefault('drafts', [])
+        db.setdefault('otp_flows', {})
         phones=list(db.get('users', {}).keys())
         first_phone=phones[0] if phones else None
         changed=False
+        for account in db.get('users', {}).values():
+            if 'phoneVerified' not in account:
+                account['phoneVerified']=True
+                changed=True
         for message in db.get('messages', []):
             if 'mailboxes' not in message:
                 if first_phone:
@@ -132,22 +137,25 @@ class Handler(BaseHTTPRequestHandler):
             if len(password)<4: return self.send(400,{'error':'Password must be at least 4 characters.'})
             if phone in db['users']: return self.send(409,{'error':'This number already has a PhoneMail account. Sign in instead.'})
             salt=secrets.token_hex(16); digest=hashlib.pbkdf2_hmac('sha256',password.encode(),salt.encode(),180000).hex()
-            db['users'][phone]={'phone':phone,'email':phone+'@phonemail.com','name':data.get('name','').strip() or 'TridentChat friend','salt':salt,'password':digest,'hasApp':bool(data.get('hasApp',True)),'language':data.get('language','English'),'aliases':[],'avatar':None,'darkMode':False,'magnification':100}
-            token=secrets.token_urlsafe(32); db['sessions'][token]=phone; save(db); return self.send(201,{'token':token,'user':public_user(db['users'][phone])})
+            db['users'][phone]={'phone':phone,'email':phone+'@phonemail.com','name':data.get('name','').strip() or 'TridentChat friend','salt':salt,'password':digest,'phoneVerified':False,'hasApp':bool(data.get('hasApp',True)),'language':data.get('language','English'),'aliases':[],'avatar':None,'darkMode':False,'magnification':100}
+            save(db); return self.send(201,{'requiresVerification':True,'user':public_user(db['users'][phone])})
         if path=='/api/login':
             phone=re.sub(r'\D','',data.get('phone','')); u=db['users'].get(phone)
             if not u or not hmac.compare_digest(u['password'],hashlib.pbkdf2_hmac('sha256',data.get('password','').encode(),u['salt'].encode(),180000).hex()): return self.send(401,{'error':'Phone number or password is incorrect.'})
+            if not u.get('phoneVerified',True): return self.send(403,{'error':'Verify this phone number to finish creating your account.','verificationRequired':True})
             token=secrets.token_urlsafe(32); db['sessions'][token]=phone; save(db); return self.send(200,{'token':token,'user':public_user(u)})
         if path=='/api/otp/start':
             phone=re.sub(r'\D','',data.get('phone','')); target=e164(data.get('phone')); mode=data.get('mode','login'); channel=data.get('channel','sms')
             if not target or len(phone)<7 or len(phone)>15: return self.send(400,{'error':'Enter a valid phone number. Use +country code for numbers outside India.'})
-            if mode not in ('login','register') or channel not in ('sms','call'): return self.send(400,{'error':'Choose SMS or phone call verification.'})
+            if mode not in ('login','verify') or channel not in ('sms','call'): return self.send(400,{'error':'Choose SMS or phone call verification.'})
             exists=phone in db['users']
-            if mode=='register' and exists: return self.send(409,{'error':'This number already has an account. Switch to sign in.'})
             if mode=='login' and not exists: return self.send(404,{'error':'No account found for this number. Switch to create an account.'})
+            if mode=='verify' and not exists: return self.send(404,{'error':'Create your account with a password first, then verify this phone.'})
+            if mode=='verify' and db['users'][phone].get('phoneVerified',True): return self.send(409,{'error':'This phone number is already verified. Sign in with your password.'})
+            if mode=='login' and not db['users'][phone].get('phoneVerified',True): return self.send(403,{'error':'Finish phone verification before signing in.','verificationRequired':True})
             try: verification=verify_request(os.environ.get('TWILIO_VERIFY_SERVICE_SID'),'Verifications',{'To':target,'Channel':channel})
-            except Exception as exc: return self.send(502,{'error':'Could not send verification. Check Twilio settings and verify this recipient in your Twilio trial account.'})
-            flow=secrets.token_urlsafe(24); db.setdefault('otp_flows',{})[flow]={'phone':phone,'to':target,'mode':mode,'name':str(data.get('name','')).strip(),'hasApp':bool(data.get('hasApp',True)),'created':int(time.time())}; save(db)
+            except Exception: return self.send(502,{'error':'Could not send the code. Check the Twilio Verify Service settings and make sure this number is verified in your trial account.'})
+            flow=secrets.token_urlsafe(24); db['otp_flows'][flow]={'phone':phone,'to':target,'mode':mode,'created':int(time.time())}; save(db)
             return self.send(200,{'flowId':flow,'channel':channel,'status':verification.get('status','pending')})
         if path=='/api/otp/check':
             flow=str(data.get('flowId','')); pending=db.get('otp_flows',{}).get(flow); code=str(data.get('code','')).strip()
@@ -156,11 +164,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception: return self.send(400,{'error':'That code is incorrect or expired. Try again or request a new one.'})
             if result.get('status')!='approved': return self.send(400,{'error':'That code is incorrect or expired. Try again.'})
             phone=pending['phone']; u=db['users'].get(phone)
-            if pending['mode']=='register':
-                if u: return self.send(409,{'error':'This number already has an account. Sign in instead.'})
-                password=secrets.token_urlsafe(32); salt=secrets.token_hex(16); digest=hashlib.pbkdf2_hmac('sha256',password.encode(),salt.encode(),180000).hex()
-                u={'phone':phone,'email':phone+'@phonemail.com','name':pending.get('name') or 'TridentChat friend','salt':salt,'password':digest,'hasApp':pending.get('hasApp',True),'language':'English','aliases':[],'avatar':None,'darkMode':False,'magnification':100}; db['users'][phone]=u
-            elif not u: return self.send(404,{'error':'No account found for this number.'})
+            if not u: return self.send(404,{'error':'No account found for this number.'})
+            if pending['mode']=='verify': u['phoneVerified']=True
+            elif not u.get('phoneVerified',True): return self.send(403,{'error':'Finish phone verification before signing in.'})
             db['otp_flows'].pop(flow,None); token=secrets.token_urlsafe(32); db['sessions'][token]=phone; save(db); return self.send(200,{'token':token,'user':public_user(u)})
         if not user: return self.send(401,{'error':'Please sign in to continue.'})
         if path=='/api/logout': db['sessions'].pop(token,None); save(db); return self.send(200,{'ok':True})
