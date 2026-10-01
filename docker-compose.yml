@@ -1,0 +1,20 @@
+services:
+  tridentchat:
+    build: .
+    image: tridentchat
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: 8080
+      DATA_FILE: /data/phonemail.json
+      # Optional Twilio trial SMS. Set all values in .env to enable.
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER:-}
+      TWILIO_VERIFY_SERVICE_SID: ${TWILIO_VERIFY_SERVICE_SID:-}
+      INBOUND_WEBHOOK_TOKEN: ${INBOUND_WEBHOOK_TOKEN:-}
+    volumes:
+      - phonemail-data:/data
+    restart: unless-stopped
+volumes:
+  phonemail-data:
